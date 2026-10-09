@@ -1,10 +1,126 @@
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from starlette.requests import Request
+
+
+def test_task_list_shows_only_the_signed_in_users_tasks(client, make_user, make_task):
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    make_task(a, "mine", "open")
+    make_task(b, "theirs", "open")
+    client.post("/login", data={"email": "a@example.com", "password": "pw"})
+    body = client.get("/").text
+    assert "mine" in body and "theirs" not in body
+
+
+def test_task_list_filters_by_status(client, make_user, make_task):
+    a = make_user("a@example.com", "pw")
+    make_task(a, "still open", "open")
+    make_task(a, "all done", "completed")
+    client.post("/login", data={"email": "a@example.com", "password": "pw"})
+    body = client.get("/", params={"status": "completed"}).text
+    assert "all done" in body and "still open" not in body
+
+
+def test_task_list_requires_a_session(client):
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/login")
+
+
+@pytest.mark.parametrize("status", [None, "", "complete", "invalid"])
+def test_task_list_ignores_invalid_status(client, make_user, make_task, sign_in, status):
+    user = make_user("a@example.com", "pw")
+    make_task(user, "still open", "open")
+    make_task(user, "all done", "completed")
+    sign_in(user.email, "pw")
+    response = client.get("/", params={} if status is None else {"status": status})
+    assert response.status_code == 200
+    assert "still open" in response.text and "all done" in response.text
+
+
+def test_task_list_open_filter_and_html_escaping(client, make_user, make_task, sign_in):
+    user = make_user("a@example.com", "pw")
+    make_task(user, "<script>alert(1)</script>", "open")
+    make_task(user, "all done", "completed")
+    sign_in(user.email, "pw")
+    response = client.get("/", params={"status": "open"})
+    assert response.status_code == 200
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert "all done" not in response.text
+
+
+def test_task_filters_select_only_the_table_and_offer_no_mutation_controls(
+    client, make_user, sign_in,
+):
+    user = make_user("a@example.com", "pw")
+    sign_in(user.email, "pw")
+    body = client.get("/").text
+    assert 'hx-get="/"' in body and 'hx-get="/?status=completed"' in body
+    assert body.count('hx-target="#task-table"') == 2
+    assert body.count('hx-select="#task-table"') == 2
+    assert body.count('hx-swap="outerHTML"') == 2
+    assert 'id="task-table"' in body
+    assert "htmx.min.js" in body
+    assert "<form" not in body and "<button" not in body
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_root_rejects_task_mutations(client, make_user, make_task, sign_in, method):
+    user = make_user("a@example.com", "pw")
+    make_task(user, "unchanged", "open")
+    sign_in(user.email, "pw")
+    response = client.request(method, "/", json={"title": "changed", "status": "completed"})
+    assert response.status_code == 405
+    assert "unchanged" in client.get("/").text
+    assert ">changed</td>" not in client.get("/").text
+
+
+def test_task_helpers_add_and_list_in_creation_order(db_session, make_user, make_task):
+    from app import tasks
+
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    newer = make_task(a, "newer", "completed")
+    older = tasks.add_task(db_session, a.id, "older")
+    older.created_at = datetime.now(timezone.utc) - timedelta(days=1)
+    make_task(b, "theirs", "open")
+    db_session.flush()
+    assert older.id is not None and older.status == "open" and older.user_id == a.id
+    assert tasks.list_tasks(db_session, a.id) == [older, newer]
+    assert tasks.list_tasks(db_session, a.id, "open") == [older]
+    assert tasks.list_tasks(db_session, a.id, "completed") == [newer]
+
+
+def test_task_helpers_complete_persists_and_is_idempotent(db_session, make_user):
+    from app import tasks
+
+    user = make_user("a@example.com", "pw")
+    task = tasks.add_task(db_session, user.id, "mine")
+    task_id = task.id
+    assert tasks.complete_task(db_session, user.id, task_id).status == "completed"
+    db_session.expire_all()
+    assert tasks.list_tasks(db_session, user.id, "completed")[0].id == task_id
+    assert tasks.complete_task(db_session, user.id, task_id).status == "completed"
+
+
+def test_task_helpers_hide_other_users_tasks_and_missing_ids(db_session, make_user, make_task):
+    from app import tasks
+
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    task_id = make_task(b, "theirs", "open").id
+    for missing_id in (task_id, uuid4()):
+        with pytest.raises(tasks.TaskNotFound):
+            tasks.complete_task(db_session, a.id, missing_id)
+    assert tasks.list_tasks(db_session, a.id) == []
+    assert tasks.list_tasks(db_session, b.id)[0].status == "open"
 
 
 @pytest.fixture

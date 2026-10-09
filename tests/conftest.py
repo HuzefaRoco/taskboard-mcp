@@ -14,7 +14,7 @@ from app.config import get_settings
 if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
-    from app.models import User
+    from app.models import Task, User
 
 # Models import app.db during collection, so select the test database first.
 if os.environ.get("TEST_DATABASE_URL"):
@@ -82,6 +82,19 @@ def make_user(db_session: Session) -> Callable[[str, str], "User"]:
         return user
 
     return create_user
+
+
+@pytest.fixture
+def make_task(db_session: Session) -> Callable[["User", str, str], "Task"]:
+    from app.models import Task
+
+    def create_task(user: "User", title: str, status: str) -> Task:
+        task = Task(user_id=user.id, title=title, status=status)
+        db_session.add(task)
+        db_session.flush()
+        return task
+
+    return create_task
 
 
 @pytest.fixture

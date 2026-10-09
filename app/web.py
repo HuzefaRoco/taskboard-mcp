@@ -11,8 +11,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
+from app import tasks
 from app.db import get_session
-from app.models import User
+from app.models import STATUS_COMPLETED, STATUS_OPEN, User
 from app.security import normalize_email, verify_password
 
 router = APIRouter()
@@ -35,6 +36,21 @@ def require_user(request: Request, session: Annotated[Session, Depends(get_sessi
     if user is None:
         raise HTTPException(303, headers={"Location": "/login?next=" + quote(request.url.path, safe="")})
     return user
+
+
+@router.get("/", response_class=HTMLResponse)
+def task_list(
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(require_user)],
+    status: str | None = None,
+) -> HTMLResponse:
+    if status not in (STATUS_OPEN, STATUS_COMPLETED):
+        status = None
+    return templates.TemplateResponse(
+        request=request, name="tasks.html",
+        context={"tasks": tasks.list_tasks(session, user.id, status)},
+    )
 
 
 @router.get("/login", response_class=HTMLResponse)

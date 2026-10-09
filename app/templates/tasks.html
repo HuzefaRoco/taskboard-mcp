@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Tasks - Taskboard{% endblock %}
+{% block content %}
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js" defer></script>
+<h1>Tasks</h1>
+<nav aria-label="Task filters">
+    <a href="/" hx-get="/" hx-target="#task-table" hx-select="#task-table" hx-swap="outerHTML">All</a>
+    <a href="/?status=completed" hx-get="/?status=completed" hx-target="#task-table" hx-select="#task-table" hx-swap="outerHTML">Completed</a>
+</nav>
+<table id="task-table">
+    <thead><tr><th scope="col">Title</th><th scope="col">Status</th></tr></thead>
+    <tbody>
+    {% for task in tasks %}
+        <tr><td>{{ task.title }}</td><td>{{ task.status }}</td></tr>
+    {% else %}
+        <tr><td colspan="2">No tasks</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
