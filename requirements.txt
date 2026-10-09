@@ -7,6 +7,7 @@ pydantic-settings
 argon2-cffi
 itsdangerous
 jinja2
+python-multipart
 mcp>=2,<3
 pytest
 httpx

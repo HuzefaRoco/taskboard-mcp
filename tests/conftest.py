@@ -1,6 +1,7 @@
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from alembic import command
@@ -9,6 +10,11 @@ from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
+
+if TYPE_CHECKING:
+    from fastapi.testclient import TestClient
+
+    from app.models import User
 
 # Models import app.db during collection, so select the test database first.
 if os.environ.get("TEST_DATABASE_URL"):
@@ -50,3 +56,39 @@ def db_session(database: Engine) -> Generator[Session, None, None]:
             finally:
                 session.close()
                 transaction.rollback()
+
+
+@pytest.fixture
+def client(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> Generator["TestClient", None, None]:
+    from fastapi.testclient import TestClient
+
+    from app.db import get_session
+    from app.main import app
+
+    monkeypatch.setitem(app.dependency_overrides, get_session, lambda: db_session)
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def make_user(db_session: Session) -> Callable[[str, str], "User"]:
+    from app.models import User
+    from app.security import hash_password
+
+    def create_user(email: str, password: str) -> User:
+        user = User(email=email, password_hash=hash_password(password))
+        db_session.add(user)
+        db_session.flush()
+        return user
+
+    return create_user
+
+
+@pytest.fixture
+def sign_in(client: "TestClient") -> Callable[[str, str], None]:
+    def login(email: str, password: str) -> None:
+        response = client.post("/login", data={"email": email, "password": password},
+                               follow_redirects=False)
+        assert response.status_code == 303
+
+    return login
