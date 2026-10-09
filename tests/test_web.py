@@ -1,3 +1,6 @@
+import subprocess
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -103,3 +106,67 @@ def test_invalid_cookie_cannot_authenticate(protected_client, make_user):
     protected_client.cookies.set("session", "tampered")
     r = protected_client.get("/_test/user", follow_redirects=False)
     assert r.status_code == 303
+
+
+@pytest.mark.parametrize("content_type", [None, "application/json", "text/plain",
+                                         "multipart/form-data; boundary=test"])
+def test_login_rejects_unsupported_content_types(client, content_type):
+    headers = {"content-type": content_type} if content_type else {}
+    r = client.post("/login", content=b"email=a%40example.com&password=right", headers=headers)
+    assert r.status_code == 415
+    assert "session" not in client.cookies
+
+
+@pytest.mark.parametrize("body", [b"email=a%40example.com&password=%ZZ",
+                                 b"email=a%40example.com&password=%FF",
+                                 b"email=a%40example.com&password=\xff",
+                                 b"email=a%40example.com&password",
+                                 b"email=a%40example.com&password=one&password=two",
+                                 b"email=a%00%40example.com&password=right",
+                                 b"email=a&password=b&next=/&extra=value"])
+def test_login_rejects_malformed_urlencoded_bodies(client, body):
+    r = client.post("/login", content=body,
+                    headers={"content-type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 400
+    assert "session" not in client.cookies
+
+
+@pytest.mark.parametrize("body", [b"", b"email=a%40example.com", b"password=right",
+                                 b"email=&password=right", b"email=a&password=",
+                                 b"email=+++&password=right"])
+def test_login_rejects_missing_or_empty_credentials(client, body):
+    r = client.post("/login", content=body,
+                    headers={"content-type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 422
+    assert "session" not in client.cookies
+
+
+def test_login_accepts_utf8_urlencoded_credentials_and_content_type_parameters(client, make_user):
+    make_user("a@example.com", "p+&=\u00e9")
+    r = client.post("/login", content=b"email=a%40example.com&password=p%2B%26%3D%C3%A9&next=%2Fconnect",
+                    headers={"content-type": "Application/X-WWW-Form-Urlencoded; charset=UTF-8"},
+                    follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/connect"
+
+
+def test_login_rejects_oversized_forms(client):
+    r = client.post("/login", content=b"email=a&password=" + b"x" * 65536,
+                    headers={"content-type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 413
+    assert "session" not in client.cookies
+
+
+def test_app_starts_without_multipart_support():
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+sys.modules["multipart"] = None
+sys.modules["python_multipart"] = None
+from app.main import app
+from fastapi.testclient import TestClient
+with TestClient(app) as client:
+    assert client.get("/login").status_code == 200
+"""],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
