@@ -34,7 +34,7 @@ def test_authorization_server_metadata(metadata_client):
         "token_endpoint": "https://tasks.example.com/token",
         "registration_endpoint": "https://tasks.example.com/register",
         "response_types_supported": ["code"],
-        "scopes_supported": ["tasks:read", "tasks:write", "offline_access"],
+        "scopes_supported": ["tasks:read", "tasks:write"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
