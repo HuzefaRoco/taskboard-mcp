@@ -123,6 +123,53 @@ def test_task_helpers_hide_other_users_tasks_and_missing_ids(db_session, make_us
     assert tasks.list_tasks(db_session, b.id)[0].status == "open"
 
 
+@pytest.mark.parametrize("operation", ["add", "list", "complete"])
+@pytest.mark.parametrize("pending_change", ["update", "insert", "delete"])
+def test_task_helpers_do_not_flush_unrelated_tasks(
+    db_session, make_user, make_task, operation, pending_change,
+):
+    from sqlalchemy import select
+
+    from app import tasks
+    from app.models import Task
+
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    mine = make_task(a, "mine", "open")
+    make_task(b, "theirs", "open")
+    unrelated = tasks.list_tasks(db_session, b.id)[0]
+    if pending_change == "update":
+        unrelated.title = "unauthorized change"
+    elif pending_change == "insert":
+        unrelated = Task(user_id=b.id, title="pending insert", status="open")
+        db_session.add(unrelated)
+    else:
+        db_session.delete(unrelated)
+
+    if operation == "add":
+        added = tasks.add_task(db_session, a.id, "added")
+        assert added.id is not None and added.user_id == a.id and added.status == "open"
+    elif operation == "list":
+        assert tasks.list_tasks(db_session, a.id) == [mine]
+    else:
+        assert tasks.complete_task(db_session, a.id, mine.id).status == "completed"
+
+    # Read stored values directly, bypassing autoflush and the ORM identity map.
+    connection = db_session.connection()
+    assert connection.execute(
+        select(Task.title, Task.status).where(Task.user_id == b.id)
+    ).all() == [("theirs", "open")]
+    assert unrelated in getattr(db_session, {"update": "dirty", "insert": "new",
+                                            "delete": "deleted"}[pending_change])
+    own_rows = connection.execute(
+        select(Task.title, Task.status).where(Task.user_id == a.id).order_by(Task.title)
+    ).all()
+    expected = [("mine", "completed" if operation == "complete" else "open")]
+    if operation == "add":
+        expected.insert(0, ("added", "open"))
+    assert own_rows == expected
+
+
 @pytest.fixture
 def protected_client(client, monkeypatch):
     from fastapi import Depends
