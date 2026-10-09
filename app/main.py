@@ -3,6 +3,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
 
+from app import oauth
 from app.config import get_settings
 from app.web import router
 
@@ -14,3 +15,4 @@ app.add_middleware(
     https_only=urlsplit(settings.public_base_url).scheme == "https",
 )
 app.include_router(router)
+app.include_router(oauth.router)
