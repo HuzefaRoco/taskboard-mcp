@@ -6,6 +6,7 @@
     {% for scope in scopes %}<li>{{ scope }}</li>{% endfor %}
 </ul>
 <form method="post" action="/authorize">
+    <input type="hidden" name="consent_token" value="{{ consent_token }}">
     {% for name, value in fields.items() %}
     <input type="hidden" name="{{ name }}" value="{{ value }}">
     {% endfor %}

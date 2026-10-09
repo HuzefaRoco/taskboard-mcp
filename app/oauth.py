@@ -1,5 +1,7 @@
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
+from time import time
 from typing import Annotated
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import uuid4
@@ -22,6 +24,8 @@ router = APIRouter()
 async def authorize_fields(request: Request) -> dict[str, str]:
     if request.method == "GET":
         pairs = list(request.query_params.multi_items())
+        if any(name in ("decision", "consent_token") for name, _ in pairs):
+            raise HTTPException(400, "Reserved authorize parameter")
         if len({name for name, _ in pairs}) != len(pairs):
             raise HTTPException(400, "Duplicate authorize parameter")
         return dict(pairs)
@@ -53,6 +57,8 @@ def authorize(
     session: Annotated[Session, Depends(get_session)],
     fields: Annotated[dict[str, str], Depends(authorize_fields)],
 ) -> Response:
+    decision = fields.pop("decision", None)
+    consent_token = fields.pop("consent_token", "")
     if any("\x00" in value for value in fields.values()):
         raise HTTPException(400, "Invalid authorize parameter")
     oauth_client = session.get(OAuthClient, fields.get("client_id", ""))
@@ -68,20 +74,31 @@ def authorize(
     user = current_user(request, session)
     if user is None:
         # Preserve the complete local URL so login's safe-next policy accepts it.
-        query = request.url.query if request.method == "GET" else urlencode({
-            name: value for name, value in fields.items() if name != "decision"
-        })
+        query = request.url.query if request.method == "GET" else urlencode(fields)
         next_url = request.url.path + ("?" + query if query else "")
         return RedirectResponse("/login?next=" + quote(next_url, safe=""), status_code=303)
     if request.method == "GET":
+        consent_token = new_token()
+        request.session["oauth_consent"] = {
+            "token_hash": token_hash(consent_token), "user_id": str(user.id),
+            "parameters_hash": token_hash(urlencode(sorted(fields.items()))),
+            "expires_at": time() + 600,
+        }
         return templates.TemplateResponse(
             request=request, name="consent.html",
             context={"client_name": oauth_client.client_name,
-                     "scopes": scope.split(), "fields": fields},
+                     "scopes": scope.split(), "fields": fields, "consent_token": consent_token},
+            headers={"Cache-Control": "no-store"},
         )
-    decision = fields.get("decision")
     if decision not in ("approve", "deny"):
         raise HTTPException(400, "Invalid consent decision")
+    consent = request.session.get("oauth_consent")
+    if (not isinstance(consent, dict) or consent.get("user_id") != str(user.id)
+            or consent.get("expires_at", 0) <= time()
+            or not secrets.compare_digest(consent.get("token_hash", ""), token_hash(consent_token))
+            or consent.get("parameters_hash") != token_hash(urlencode(sorted(fields.items())))):
+        raise HTTPException(403, "Invalid or expired consent")
+    del request.session["oauth_consent"]
     result = {"state": fields.get("state", "")}
     if decision == "deny":
         result["error"] = "access_denied"

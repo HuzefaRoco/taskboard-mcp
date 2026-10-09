@@ -48,7 +48,9 @@ def test_authorize_redirects_to_login_when_signed_out(client, oauth_client, make
     assert logged_in.headers["location"] == next_url
     consent = client.get(next_url)
     assert consent.status_code == 200
-    assert HiddenFields(consent.text).fields == params
+    fields = HiddenFields(consent.text).fields
+    assert fields.pop("consent_token")
+    assert fields == params
 
 
 def test_authorize_renders_consent_then_issues_a_code(
@@ -60,10 +62,12 @@ def test_authorize_renders_consent_then_issues_a_code(
     params = {**AUTH, "client_id": oauth_client}
     consent = client.get("/authorize", params=params)
     assert consent.status_code == 200
+    assert consent.headers["cache-control"] == "no-store"
     assert "ChatGPT" in consent.text and "tasks:read" in consent.text
     assert "tasks:write" in consent.text
     fields = HiddenFields(consent.text).fields
-    assert fields == params
+    assert fields.get("consent_token")
+    assert {k: v for k, v in fields.items() if k != "consent_token"} == params
     assert 'name="decision" value="approve"' in consent.text
     assert 'name="decision" value="deny"' in consent.text
     before = datetime.now(timezone.utc)
@@ -109,7 +113,8 @@ def test_authorize_rejects_invalid_parameters(
 def test_deny_returns_access_denied(client, oauth_client, make_user, sign_in, db_session):
     make_user("a@example.com", "pw")
     sign_in("a@example.com", "pw")
-    response = client.post("/authorize", data={**AUTH, "client_id": oauth_client, "decision": "deny"},
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    response = client.post("/authorize", data={**fields, "decision": "deny"},
                            follow_redirects=False)
     assert response.status_code == 303
     assert parse_qs(urlsplit(response.headers["location"]).query) == {
@@ -131,7 +136,8 @@ def test_signed_out_post_does_not_issue_a_code(client, oauth_client, db_session)
 def test_authorize_requires_an_explicit_decision(client, oauth_client, make_user, sign_in, decision):
     make_user("a@example.com", "pw")
     sign_in("a@example.com", "pw")
-    response = client.post("/authorize", data={**AUTH, "client_id": oauth_client, "decision": decision},
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    response = client.post("/authorize", data={**fields, "decision": decision},
                            follow_redirects=False)
     assert response.status_code == 400
 
@@ -146,9 +152,10 @@ def test_authorize_preserves_callback_query_and_encodes_state(
     make_user("a@example.com", "pw")
     sign_in("a@example.com", "pw")
     state = "a+&=\"<tag>"
-    response = client.post("/authorize", data={
-        **AUTH, "client_id": oauth_client, "redirect_uri": callback, "state": state, "decision": decision,
-    }, follow_redirects=False)
+    fields = HiddenFields(client.get("/authorize", params={
+        **AUTH, "client_id": oauth_client, "redirect_uri": callback, "state": state,
+    }).text).fields
+    response = client.post("/authorize", data={**fields, "decision": decision}, follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"].startswith(callback + "&")
     query = parse_qs(urlsplit(response.headers["location"]).query)
@@ -194,16 +201,125 @@ def test_authorize_rolls_back_database_failure(client, oauth_client, make_user, 
 
     make_user("a@example.com", "pw")
     sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
 
     def fail_commit():
         raise SQLAlchemyError("private database details")
 
     with monkeypatch.context() as patch:
         patch.setattr(db_session, "commit", fail_commit)
-        response = client.post("/authorize", data={**AUTH, "client_id": oauth_client, "decision": "approve"})
+        response = client.post("/authorize", data={**fields, "decision": "approve"})
     assert response.status_code == 500
     assert response.json() == {"error": "server_error"}
     assert db_session.query(AuthorizationCode).count() == 0
+
+
+@pytest.mark.parametrize("display_consent", [False, True])
+def test_same_site_forged_approval_cannot_write_a_code(
+    client, make_user, sign_in, db_session, display_consent,
+):
+    client.base_url = "https://tasks.example.com"
+    callback = "https://evil.example.com/callback"
+    registered = client.post("/register", json={"client_name": "Attacker", "redirect_uris": [callback]})
+    assert registered.status_code == 201
+    make_user("victim@example.com", "pw")
+    sign_in("victim@example.com", "pw")
+    params = {**AUTH, "client_id": registered.json()["client_id"], "redirect_uri": callback}
+    if display_consent:
+        assert client.get("/authorize", params=params).status_code == 200
+    response = client.post("/authorize", data={**params, "decision": "approve"},
+                           headers={"Origin": "https://evil.example.com"}, follow_redirects=False)
+    assert response.status_code == 403 and "location" not in response.headers
+    assert db_session.query(AuthorizationCode).count() == 0
+
+
+@pytest.mark.parametrize("token", ["wrong", "", "\u00e9"])
+def test_wrong_consent_token_cannot_write_a_code(client, oauth_client, make_user, sign_in, db_session, token):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    response = client.post("/authorize", data={**fields, "consent_token": token, "decision": "approve"},
+                           follow_redirects=False)
+    assert response.status_code == 403 and "location" not in response.headers
+    assert db_session.query(AuthorizationCode).count() == 0
+
+
+def test_stale_consent_token_cannot_write_a_code(client, oauth_client, make_user, sign_in, db_session):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    params = {**AUTH, "client_id": oauth_client}
+    stale = HiddenFields(client.get("/authorize", params=params).text).fields
+    fresh = HiddenFields(client.get("/authorize", params=params).text).fields
+    response = client.post("/authorize", data={**stale, "decision": "approve"}, follow_redirects=False)
+    assert response.status_code == 403
+    assert db_session.query(AuthorizationCode).count() == 0
+    assert stale["consent_token"] != fresh["consent_token"]
+    assert client.post("/authorize", data={**fresh, "decision": "approve"}, follow_redirects=False).status_code == 303
+
+
+def test_expired_consent_token_cannot_write_a_code(
+    client, oauth_client, make_user, sign_in, db_session, monkeypatch,
+):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    expired_time = datetime.now(timezone.utc).timestamp() + 601
+    monkeypatch.setattr("app.oauth.time", lambda: expired_time, raising=False)
+    response = client.post("/authorize", data={**fields, "decision": "approve"}, follow_redirects=False)
+    assert response.status_code == 403
+    assert db_session.query(AuthorizationCode).count() == 0
+
+
+@pytest.mark.parametrize("changes", [
+    {"scope": "tasks:read"}, {"state": "attacker"},
+    {"code_challenge": "A" * 43}, {"resource": "https://other.example.com"},
+])
+def test_consent_token_is_bound_to_displayed_parameters(
+    client, oauth_client, make_user, sign_in, db_session, changes,
+):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    response = client.post("/authorize", data={**fields, **changes, "decision": "approve"},
+                           follow_redirects=False)
+    assert response.status_code == 403
+    assert db_session.query(AuthorizationCode).count() == 0
+
+
+def test_consent_token_cannot_transfer_to_another_signed_in_session(
+    client, oauth_client, make_user, sign_in, db_session,
+):
+    make_user("a@example.com", "pw")
+    make_user("b@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    sign_in("b@example.com", "pw")
+    response = client.post("/authorize", data={**fields, "decision": "approve"}, follow_redirects=False)
+    assert response.status_code == 403
+    assert db_session.query(AuthorizationCode).count() == 0
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+def test_completed_consent_cannot_be_resubmitted(
+    client, oauth_client, make_user, sign_in, db_session, decision,
+):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    fields = HiddenFields(client.get("/authorize", params={**AUTH, "client_id": oauth_client}).text).fields
+    assert client.post("/authorize", data={**fields, "decision": decision}, follow_redirects=False).status_code == 303
+    before = db_session.query(AuthorizationCode).count()
+    response = client.post("/authorize", data={**fields, "decision": "approve"}, follow_redirects=False)
+    assert response.status_code == 403
+    assert db_session.query(AuthorizationCode).count() == before
+
+
+@pytest.mark.parametrize("reserved", ["decision", "consent_token"])
+def test_authorize_rejects_reserved_get_parameters(client, oauth_client, make_user, sign_in, reserved):
+    make_user("a@example.com", "pw")
+    sign_in("a@example.com", "pw")
+    response = client.get("/authorize", params={**AUTH, "client_id": oauth_client, reserved: "deny"},
+                          follow_redirects=False)
+    assert response.status_code == 400
 
 
 @pytest.fixture
