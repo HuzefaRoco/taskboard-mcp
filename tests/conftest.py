@@ -105,3 +105,13 @@ def sign_in(client: "TestClient") -> Callable[[str, str], None]:
         assert response.status_code == 303
 
     return login
+
+
+@pytest.fixture
+def oauth_client(client: "TestClient") -> str:
+    response = client.post("/register", json={
+        "client_name": "ChatGPT",
+        "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    })
+    assert response.status_code == 201
+    return response.json()["client_id"]
