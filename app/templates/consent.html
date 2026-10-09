@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Authorize - Taskboard{% endblock %}
+{% block content %}
+<h1>Authorize {{ client_name }}</h1>
+<ul>
+    {% for scope in scopes %}<li>{{ scope }}</li>{% endfor %}
+</ul>
+<form method="post" action="/authorize">
+    {% for name, value in fields.items() %}
+    <input type="hidden" name="{{ name }}" value="{{ value }}">
+    {% endfor %}
+    <button type="submit" name="decision" value="approve">Approve</button>
+    <button type="submit" name="decision" value="deny">Deny</button>
+</form>
+{% endblock %}

@@ -1,20 +1,107 @@
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
 from app.config import get_settings
 from app.db import get_session
-from app.models import OAuthClient
-from app.security import SCOPE_READ, SCOPE_WRITE
+from app.models import AuthorizationCode, OAuthClient
+from app.security import SCOPE_READ, SCOPE_WRITE, new_token, token_hash
+from app.web import current_user, templates
 
 router = APIRouter()
+
+
+async def authorize_fields(request: Request) -> dict[str, str]:
+    if request.method == "GET":
+        pairs = list(request.query_params.multi_items())
+        if len({name for name, _ in pairs}) != len(pairs):
+            raise HTTPException(400, "Duplicate authorize parameter")
+        return dict(pairs)
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        raise HTTPException(415, "Expected a URL-encoded consent form")
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > 65536:
+                raise HTTPException(413, "Consent form is too large")
+            body.extend(chunk)
+        encoded = body.decode("utf-8")
+        if re.search(r"%(?![0-9a-fA-F]{2})", encoded):
+            raise ValueError("Invalid percent encoding")
+        fields = parse_qs(encoded, keep_blank_values=True, strict_parsing=True,
+                          errors="strict", max_num_fields=32)
+        if any(len(values) != 1 for values in fields.values()):
+            raise ValueError("Duplicate form field")
+    except (ClientDisconnect, UnicodeError, ValueError):
+        raise HTTPException(400, "Malformed consent form") from None
+    return {name: values[0] for name, values in fields.items()}
+
+
+@router.get("/authorize")
+@router.post("/authorize")
+def authorize(
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    fields: Annotated[dict[str, str], Depends(authorize_fields)],
+) -> Response:
+    if any("\x00" in value for value in fields.values()):
+        raise HTTPException(400, "Invalid authorize parameter")
+    oauth_client = session.get(OAuthClient, fields.get("client_id", ""))
+    redirect_uri = fields.get("redirect_uri", "")
+    scope = fields.get("scope", "")
+    if (oauth_client is None or fields.get("response_type") != "code"
+            or redirect_uri not in oauth_client.redirect_uris
+            or fields.get("code_challenge_method") != "S256"
+            or not re.fullmatch(r"[A-Za-z0-9_-]{43}", fields.get("code_challenge", ""))
+            or not scope.split() or not set(scope.split()).issubset(required_scopes())
+            or not fields.get("resource")):
+        raise HTTPException(400, "Invalid authorization request")
+    user = current_user(request, session)
+    if user is None:
+        # Preserve the complete local URL so login's safe-next policy accepts it.
+        query = request.url.query if request.method == "GET" else urlencode({
+            name: value for name, value in fields.items() if name != "decision"
+        })
+        next_url = request.url.path + ("?" + query if query else "")
+        return RedirectResponse("/login?next=" + quote(next_url, safe=""), status_code=303)
+    if request.method == "GET":
+        return templates.TemplateResponse(
+            request=request, name="consent.html",
+            context={"client_name": oauth_client.client_name,
+                     "scopes": scope.split(), "fields": fields},
+        )
+    decision = fields.get("decision")
+    if decision not in ("approve", "deny"):
+        raise HTTPException(400, "Invalid consent decision")
+    result = {"state": fields.get("state", "")}
+    if decision == "deny":
+        result["error"] = "access_denied"
+    else:
+        code = new_token()
+        authorization_code = AuthorizationCode(
+            code_hash=token_hash(code), client_id=oauth_client.client_id, user_id=user.id,
+            redirect_uri=redirect_uri, scope=scope, code_challenge=fields["code_challenge"],
+            code_challenge_method="S256", resource=fields["resource"],
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=600),
+        )
+        try:
+            session.add(authorization_code)
+            session.commit()
+        except SQLAlchemyError:
+            session.rollback()
+            return JSONResponse({"error": "server_error"}, status_code=500)
+        result["code"] = code
+    separator = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(redirect_uri + separator + urlencode(result), status_code=303)
 
 
 async def registration_metadata(request: Request) -> object:
