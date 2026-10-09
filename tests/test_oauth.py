@@ -63,6 +63,8 @@ def test_required_scopes():
 @pytest.mark.parametrize("redirect_uris", [
     ["https://chatgpt.com/connector_platform_oauth_redirect"],
     ["http://localhost:8080/callback", "https://example.com/callback?x=1"],
+    ["https://example.com/call%20back?next=%2Ftasks&x=a:b@c/?d=1",
+     "http://localhost:8080/call%2Fback?x=%25", "https://[::1]:8443/callback"],
 ])
 def test_register_creates_a_public_client(client, db_session, redirect_uris):
     from uuid import UUID
@@ -95,6 +97,13 @@ def test_register_creates_a_public_client(client, db_session, redirect_uris):
         ["https://user:password@example.com/callback"],
         ["https://example.com/\ncallback"], ["https://example.com/ callback"],
         ["https://example.com/\\callback"],
+        ["https://exa<mple.com/callback"], ["https://example.com/%ZZ"],
+        ["https://exa>mple.com/callback"], ["https://exa|mple.com/callback"],
+        ["https://exa{mple.com/callback"], ["https://exa\"mple.com/callback"],
+        ["https://example.com/%"], ["https://example.com/%2"],
+        ["https://example.com/callback?next=%GG"], ["https://exa%ZZmple.com/callback"],
+        ["https://example.com/call<back"], ["https://example.com/callback?x={bad}"],
+        ["https://example.com/callback", "https://example.com/%ZZ"],
     ]],
     {"redirect_uris": ["https://example.com"], "client_name": None},
     {"redirect_uris": ["https://example.com"], "client_name": 123},

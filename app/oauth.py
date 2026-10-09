@@ -1,3 +1,4 @@
+import re
 from typing import Annotated
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -44,6 +45,14 @@ def register_client(
         try:
             parsed = urlsplit(uri)
             port = parsed.port
+            # urlsplit separates components but does not validate their URI syntax.
+            if (re.search(r"%(?![0-9A-Fa-f]{2})", uri)
+                    or not re.fullmatch(
+                        r"(?:[A-Za-z0-9._~!$&'()*+,;=%-]+|\[[A-Za-z0-9._~!$&'()*+,;=:%-]+\])"
+                        r"(?::[0-9]+)?", parsed.netloc)
+                    or not re.fullmatch(r"[A-Za-z0-9._~!$&'()*+,;=:@/%-]*", parsed.path)
+                    or not re.fullmatch(r"[A-Za-z0-9._~!$&'()*+,;=:@/?%-]*", parsed.query)):
+                return invalid
             if (not parsed.hostname or parsed.username is not None
                     or parsed.password is not None or "#" in uri
                     or (port is not None and port == 0)
