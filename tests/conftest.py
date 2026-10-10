@@ -3,6 +3,7 @@ import hashlib
 import os
 import secrets
 from collections.abc import Callable, Generator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
@@ -11,7 +12,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy.engine import Engine, make_url
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
 
@@ -66,11 +67,15 @@ def db_session(database: Engine) -> Generator[Session, None, None]:
 def client(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> Generator["TestClient", None, None]:
     from fastapi.testclient import TestClient
 
+    from app import mcp_server
     from app.db import get_session
     from app.main import app
 
     monkeypatch.setitem(app.dependency_overrides, get_session, lambda: db_session)
-    with TestClient(app) as test_client:
+    monkeypatch.setattr(mcp_server, "SessionLocal", sessionmaker(
+        bind=db_session.bind, join_transaction_mode="create_savepoint",
+    ))
+    with TestClient(app, base_url=get_settings().public_base_url) as test_client:
         yield test_client
 
 
@@ -158,3 +163,49 @@ def tokens(client: "TestClient", authorize_code) -> Callable[[str], dict[str, st
         return response.json()
 
     return exchange
+
+
+@pytest.fixture
+def mcp_url() -> str:
+    return "/mcp"
+
+
+@pytest.fixture
+def bearer(db_session: Session, make_user, oauth_client: str) -> str:
+    from app.security import issue_tokens
+
+    user = make_user("mcp@example.com", "pw")
+    issued = issue_tokens(
+        db_session, user_id=user.id, client_id=oauth_client,
+        scope="tasks:read tasks:write", resource=get_settings().public_base_url,
+    )
+    db_session.commit()
+    return issued["access_token"]
+
+
+@pytest.fixture
+def revoke(db_session: Session) -> Callable[[str], None]:
+    from app.models import Token
+    from app.security import token_hash
+
+    def revoke_token(raw_token: str) -> None:
+        token = db_session.get(Token, token_hash(raw_token))
+        assert token is not None
+        token.revoked_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+    return revoke_token
+
+
+@pytest.fixture
+def expire(db_session: Session) -> Callable[[str], None]:
+    from app.models import Token
+    from app.security import token_hash
+
+    def expire_token(raw_token: str) -> None:
+        token = db_session.get(Token, token_hash(raw_token))
+        assert token is not None
+        token.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db_session.commit()
+
+    return expire_token
