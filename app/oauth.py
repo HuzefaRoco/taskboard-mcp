@@ -15,7 +15,7 @@ from starlette.requests import ClientDisconnect
 
 from app.config import get_settings
 from app.db import get_session
-from app.models import AuthorizationCode, OAuthClient
+from app.models import AuthorizationCode, OAuthClient, Token
 from app.security import SCOPE_READ, SCOPE_WRITE, issue_tokens, new_token, token_hash, verify_pkce
 from app.web import current_user, templates
 
@@ -42,9 +42,27 @@ def exchange_code(
     headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
     if fields is None:
         return JSONResponse({"error": "invalid_request"}, status_code=400, headers=headers)
-    if fields.get("grant_type") != "authorization_code":
+    if fields.get("grant_type") not in ("authorization_code", "refresh_token"):
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400, headers=headers)
     invalid = JSONResponse({"error": "invalid_grant"}, status_code=400, headers=headers)
+    if fields["grant_type"] == "refresh_token":
+        try:
+            # Lock until commit so concurrent requests cannot rotate the same token.
+            refresh = session.scalar(select(Token).where(
+                Token.token_hash == token_hash(fields.get("refresh_token", "")),
+            ).with_for_update())
+            now = datetime.now(timezone.utc)
+            if (refresh is None or refresh.kind != "refresh" or refresh.revoked_at is not None
+                    or refresh.expires_at <= now or refresh.client_id != fields.get("client_id")):
+                return invalid
+            refresh.revoked_at = now
+            tokens = issue_tokens(session, user_id=refresh.user_id, client_id=refresh.client_id,
+                                  scope=refresh.scope, resource=refresh.resource)
+            session.commit()
+        except SQLAlchemyError:
+            session.rollback()
+            return JSONResponse({"error": "server_error"}, status_code=500, headers=headers)
+        return JSONResponse({**tokens, "expires_in": int(tokens["expires_in"])}, headers=headers)
     base = get_settings().public_base_url
     resources = (base, base + "/mcp")
     verifier = fields.get("code_verifier", "")

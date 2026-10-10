@@ -143,3 +143,18 @@ def authorize_code(client: "TestClient", make_user, sign_in) -> Callable[..., tu
         return parse_qs(urlsplit(response.headers["location"]).query)["code"][0], verifier
 
     return approve
+
+
+@pytest.fixture
+def tokens(client: "TestClient", authorize_code) -> Callable[[str], dict[str, str | int]]:
+    from tests.test_oauth import TOKEN
+
+    def exchange(client_id: str) -> dict[str, str | int]:
+        code, verifier = authorize_code(client_id)
+        response = client.post("/token", data={
+            **TOKEN, "code": code, "client_id": client_id, "code_verifier": verifier,
+        })
+        assert response.status_code == 200
+        return response.json()
+
+    return exchange

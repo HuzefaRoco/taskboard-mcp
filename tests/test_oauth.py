@@ -109,7 +109,7 @@ def test_token_rejects_invalid_stored_codes(metadata_client, oauth_client, autho
     assert db_session.query(Token).count() == 0
 
 
-@pytest.mark.parametrize("data", [{}, {"grant_type": "refresh_token"}, {"grant_type": "unknown"}])
+@pytest.mark.parametrize("data", [{}, {"grant_type": "unknown"}])
 def test_token_rejects_unsupported_grant_type(client, data):
     response = client.post("/token", data=data)
     assert response.status_code == 400 and response.json()["error"] == "unsupported_grant_type"
@@ -156,6 +156,104 @@ def test_token_uses_configured_lifetimes(metadata_client, oauth_client, authoriz
         raw = response.json()[kind + "_token"]
         stored = db_session.get(Token, hashlib.sha256(raw.encode()).hexdigest())
         assert before + timedelta(seconds=ttl) <= stored.expires_at <= after + timedelta(seconds=ttl)
+
+
+def test_refresh_returns_a_new_access_token_and_rotates(metadata_client, oauth_client, sign_in,
+                                                       tokens, db_session, monkeypatch):
+    sign_in("a@example.com", "pw")
+    original = tokens(oauth_client)
+    old = db_session.get(Token, hashlib.sha256(original["refresh_token"].encode()).hexdigest())
+    monkeypatch.setenv("ACCESS_TOKEN_TTL_SECONDS", "120")
+    monkeypatch.setenv("REFRESH_TOKEN_TTL_SECONDS", "600")
+    get_settings.cache_clear()
+    before = datetime.now(timezone.utc)
+    response = metadata_client.post("/token", data={
+        "grant_type": "refresh_token", "refresh_token": original["refresh_token"],
+        "client_id": oauth_client,
+    })
+    after = datetime.now(timezone.utc)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["token_type"] == "Bearer"
+    assert body["expires_in"] == 120 and type(body["expires_in"]) is int
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    db_session.refresh(old)
+    assert before <= old.revoked_at <= after
+    for kind, ttl in [("access", 120), ("refresh", 600)]:
+        raw = body[kind + "_token"]
+        assert raw != original[kind + "_token"]
+        stored = db_session.get(Token, hashlib.sha256(raw.encode()).hexdigest())
+        assert stored is not None and db_session.get(Token, raw) is None
+        assert stored.kind == kind and stored.revoked_at is None
+        assert stored.user_id == old.user_id and stored.client_id == old.client_id
+        assert stored.scope == old.scope and stored.resource == old.resource
+        assert before + timedelta(seconds=ttl) <= stored.expires_at <= after + timedelta(seconds=ttl)
+
+
+def test_a_rotated_refresh_token_cannot_be_reused(metadata_client, oauth_client, sign_in, tokens,
+                                                db_session):
+    sign_in("a@example.com", "pw")
+    refresh = tokens(oauth_client)["refresh_token"]
+    data = {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": oauth_client}
+    first = metadata_client.post("/token", data=data)
+    assert first.status_code == 200
+    again = metadata_client.post("/token", data=data)
+    assert again.status_code == 400 and again.json()["error"] == "invalid_grant"
+    assert db_session.query(Token).count() == 4
+    assert metadata_client.post("/token", data={
+        **data, "refresh_token": first.json()["refresh_token"],
+    }).status_code == 200
+
+
+@pytest.mark.parametrize("changes", ["missing", "unknown", "access", "wrong-client",
+                                     "missing-client", "expired", "revoked"])
+def test_refresh_rejects_invalid_grants(metadata_client, oauth_client, tokens, db_session, changes):
+    original = tokens(oauth_client)
+    old = db_session.get(Token, hashlib.sha256(original["refresh_token"].encode()).hexdigest())
+    data = {"grant_type": "refresh_token", "refresh_token": original["refresh_token"],
+            "client_id": oauth_client}
+    if changes == "missing":
+        del data["refresh_token"]
+    elif changes == "unknown":
+        data["refresh_token"] = "unknown"
+    elif changes == "access":
+        data["refresh_token"] = original["access_token"]
+    elif changes == "wrong-client":
+        data["client_id"] = "other"
+    elif changes == "missing-client":
+        del data["client_id"]
+    elif changes == "expired":
+        old.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    else:
+        old.revoked_at = datetime.now(timezone.utc)
+    db_session.commit()
+    response = metadata_client.post("/token", data=data)
+    assert response.status_code == 400 and response.json() == {"error": "invalid_grant"}
+    assert db_session.query(Token).count() == 2
+    if changes != "revoked":
+        db_session.refresh(old)
+        assert old.revoked_at is None
+
+
+def test_refresh_rolls_back_database_failure(metadata_client, oauth_client, tokens,
+                                            db_session, monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    refresh = tokens(oauth_client)["refresh_token"]
+    data = {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": oauth_client}
+
+    def fail_commit():
+        raise SQLAlchemyError("private database details")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db_session, "commit", fail_commit)
+        response = metadata_client.post("/token", data=data)
+    assert response.status_code == 500 and response.json() == {"error": "server_error"}
+    assert db_session.query(Token).count() == 2
+    old = db_session.get(Token, hashlib.sha256(refresh.encode()).hexdigest())
+    assert old.revoked_at is None
+    assert metadata_client.post("/token", data=data).status_code == 200
 
 
 class HiddenFields(HTMLParser):
