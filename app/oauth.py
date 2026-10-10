@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
@@ -15,10 +16,60 @@ from starlette.requests import ClientDisconnect
 from app.config import get_settings
 from app.db import get_session
 from app.models import AuthorizationCode, OAuthClient
-from app.security import SCOPE_READ, SCOPE_WRITE, new_token, token_hash
+from app.security import SCOPE_READ, SCOPE_WRITE, issue_tokens, new_token, token_hash, verify_pkce
 from app.web import current_user, templates
 
 router = APIRouter()
+
+
+async def token_fields(request: Request) -> dict[str, str] | None:
+    if request.headers.get("content-length") == "0":
+        return {}
+    try:
+        fields = await authorize_fields(request)
+    except HTTPException:
+        return None
+    if any("\x00" in value for value in fields.values()):
+        return None
+    return fields
+
+
+@router.post("/token")
+def exchange_code(
+    fields: Annotated[dict[str, str] | None, Depends(token_fields)],
+    session: Annotated[Session, Depends(get_session)],
+) -> JSONResponse:
+    headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+    if fields is None:
+        return JSONResponse({"error": "invalid_request"}, status_code=400, headers=headers)
+    if fields.get("grant_type") != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400, headers=headers)
+    invalid = JSONResponse({"error": "invalid_grant"}, status_code=400, headers=headers)
+    base = get_settings().public_base_url
+    resources = (base, base + "/mcp")
+    verifier = fields.get("code_verifier", "")
+    if (fields.get("resource") not in resources
+            or not re.fullmatch(r"[A-Za-z0-9._~-]{43,128}", verifier)):
+        return invalid
+    try:
+        # Lock until commit so concurrent exchanges cannot reuse the same code.
+        code = session.scalar(select(AuthorizationCode).where(
+            AuthorizationCode.code_hash == token_hash(fields.get("code", "")),
+        ).with_for_update())
+        if (code is None or code.expires_at <= datetime.now(timezone.utc)
+                or code.client_id != fields.get("client_id")
+                or code.redirect_uri != fields.get("redirect_uri")
+                or code.resource not in resources or code.code_challenge_method != "S256"
+                or not verify_pkce(verifier, code.code_challenge)):
+            return invalid
+        tokens = issue_tokens(session, user_id=code.user_id, client_id=code.client_id,
+                              scope=code.scope, resource=code.resource)
+        session.delete(code)
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        return JSONResponse({"error": "server_error"}, status_code=500, headers=headers)
+    return JSONResponse({**tokens, "expires_in": int(tokens["expires_in"])}, headers=headers)
 
 
 async def authorize_fields(request: Request) -> dict[str, str]:

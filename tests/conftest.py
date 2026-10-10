@@ -1,7 +1,11 @@
+import base64
+import hashlib
 import os
+import secrets
 from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from alembic import command
@@ -115,3 +119,27 @@ def oauth_client(client: "TestClient") -> str:
     })
     assert response.status_code == 201
     return response.json()["client_id"]
+
+
+@pytest.fixture
+def authorize_code(client: "TestClient", make_user, sign_in) -> Callable[..., tuple[str, str]]:
+    from tests.test_oauth import AUTH, HiddenFields
+
+    make_user("a@example.com", "pw")
+
+    def approve(client_id: str, resource: str = "https://tasks.example.com") -> tuple[str, str]:
+        sign_in("a@example.com", "pw")
+        verifier = secrets.token_urlsafe(32)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=")
+        consent = client.get("/authorize", params={
+            **AUTH, "client_id": client_id, "resource": resource,
+            "code_challenge": challenge.decode("ascii"),
+        })
+        assert consent.status_code == 200
+        response = client.post("/authorize", data={
+            **HiddenFields(consent.text).fields, "decision": "approve",
+        }, follow_redirects=False)
+        assert response.status_code == 303
+        return parse_qs(urlsplit(response.headers["location"]).query)["code"][0], verifier
+
+    return approve

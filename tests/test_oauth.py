@@ -1,12 +1,12 @@
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
 from app.config import get_settings
-from app.models import AuthorizationCode, OAuthClient
+from app.models import AuthorizationCode, OAuthClient, Token
 
 
 AUTH = {
@@ -18,6 +18,144 @@ AUTH = {
     "state": "xyz",
     "resource": "https://tasks.example.com",
 }
+
+TOKEN = {
+    "grant_type": "authorization_code",
+    "redirect_uri": AUTH["redirect_uri"],
+    "resource": "https://tasks.example.com",
+}
+
+
+def test_token_exchanges_a_code_for_tokens(metadata_client, oauth_client, sign_in, authorize_code,
+                                          db_session):
+    sign_in("a@example.com", "pw")
+    code, verifier = authorize_code(oauth_client)
+    stored_code = db_session.get(AuthorizationCode, hashlib.sha256(code.encode()).hexdigest())
+    user_id = stored_code.user_id
+    before = datetime.now(timezone.utc)
+    response = metadata_client.post("/token", data={
+        **TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier,
+    })
+    after = datetime.now(timezone.utc)
+    body = response.json()
+    assert response.status_code == 200 and body["token_type"] == "Bearer"
+    assert body["expires_in"] == 3600 and type(body["expires_in"]) is int
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert db_session.get(AuthorizationCode, hashlib.sha256(code.encode()).hexdigest()) is None
+    for kind, ttl in [("access", 3600), ("refresh", 2592000)]:
+        raw = body[kind + "_token"]
+        stored = db_session.get(Token, hashlib.sha256(raw.encode()).hexdigest())
+        assert stored is not None and db_session.get(Token, raw) is None
+        assert stored.kind == kind and stored.user_id == user_id
+        assert stored.client_id == oauth_client and stored.scope == AUTH["scope"]
+        assert stored.resource == TOKEN["resource"]
+        assert before + timedelta(seconds=ttl) <= stored.expires_at <= after + timedelta(seconds=ttl)
+
+
+@pytest.mark.parametrize("changes", [
+    {"code_verifier": "wrong"}, {"code_verifier": ""}, {"code": "unknown"}, {"code": ""},
+    {"client_id": "other"}, {"client_id": ""},
+    {"redirect_uri": AUTH["redirect_uri"] + "/"}, {"redirect_uri": ""},
+    {"resource": "https://evil.example.com"}, {"resource": ""},
+])
+def test_token_rejects_invalid_grants(metadata_client, oauth_client, authorize_code, db_session,
+                                     changes):
+    code, verifier = authorize_code(oauth_client)
+    data = {**TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier}
+    response = metadata_client.post("/token", data={**data, **changes})
+    assert response.status_code == 400 and response.json() == {"error": "invalid_grant"}
+    assert db_session.query(Token).count() == 0
+    assert metadata_client.post("/token", data=data).status_code == 200
+
+
+def test_token_rejects_a_replayed_code(metadata_client, oauth_client, sign_in, authorize_code):
+    sign_in("a@example.com", "pw")
+    code, verifier = authorize_code(oauth_client)
+    data = {**TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier}
+    assert metadata_client.post("/token", data=data).status_code == 200
+    response = metadata_client.post("/token", data=data)
+    assert response.status_code == 400 and response.json()["error"] == "invalid_grant"
+
+
+@pytest.mark.parametrize("stored_suffix", ["", "/mcp"])
+@pytest.mark.parametrize("requested_suffix", ["", "/mcp"])
+def test_token_accepts_the_mcp_url_as_resource(metadata_client, oauth_client, authorize_code,
+                                             stored_suffix, requested_suffix):
+    code, verifier = authorize_code(oauth_client, resource=TOKEN["resource"] + stored_suffix)
+    response = metadata_client.post("/token", data={
+        **TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier,
+        "resource": TOKEN["resource"] + requested_suffix,
+    })
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("changes", ["expired", "wrong-resource", "plain"])
+def test_token_rejects_invalid_stored_codes(metadata_client, oauth_client, authorize_code,
+                                          db_session, changes):
+    code, verifier = authorize_code(oauth_client)
+    stored = db_session.get(AuthorizationCode, hashlib.sha256(code.encode()).hexdigest())
+    if changes == "expired":
+        stored.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif changes == "wrong-resource":
+        stored.resource = "https://evil.example.com"
+    else:
+        stored.code_challenge_method = "plain"
+    db_session.commit()
+    response = metadata_client.post("/token", data={
+        **TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier,
+    })
+    assert response.status_code == 400 and response.json()["error"] == "invalid_grant"
+    assert db_session.query(Token).count() == 0
+
+
+@pytest.mark.parametrize("data", [{}, {"grant_type": "refresh_token"}, {"grant_type": "unknown"}])
+def test_token_rejects_unsupported_grant_type(client, data):
+    response = client.post("/token", data=data)
+    assert response.status_code == 400 and response.json()["error"] == "unsupported_grant_type"
+
+
+@pytest.mark.parametrize("body", [b"code=%ZZ", b"code=\xff", b"code=a&code=b", b"code=%00"])
+def test_token_rejects_malformed_forms(client, body):
+    response = client.post("/token", content=body,
+                           headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert response.status_code == 400 and response.json()["error"] == "invalid_request"
+
+
+def test_token_rolls_back_database_failure(metadata_client, oauth_client, authorize_code,
+                                         db_session, monkeypatch):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    code, verifier = authorize_code(oauth_client)
+    data = {**TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier}
+
+    def fail_commit():
+        raise SQLAlchemyError("private database details")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db_session, "commit", fail_commit)
+        response = metadata_client.post("/token", data=data)
+    assert response.status_code == 500 and response.json() == {"error": "server_error"}
+    assert db_session.query(Token).count() == 0
+    assert metadata_client.post("/token", data=data).status_code == 200
+
+
+def test_token_uses_configured_lifetimes(metadata_client, oauth_client, authorize_code,
+                                       db_session, monkeypatch):
+    monkeypatch.setenv("ACCESS_TOKEN_TTL_SECONDS", "120")
+    monkeypatch.setenv("REFRESH_TOKEN_TTL_SECONDS", "600")
+    get_settings.cache_clear()
+    code, verifier = authorize_code(oauth_client)
+    before = datetime.now(timezone.utc)
+    response = metadata_client.post("/token", data={
+        **TOKEN, "code": code, "client_id": oauth_client, "code_verifier": verifier,
+    })
+    after = datetime.now(timezone.utc)
+    assert response.status_code == 200 and response.json()["expires_in"] == 120
+    for kind, ttl in [("access", 120), ("refresh", 600)]:
+        raw = response.json()[kind + "_token"]
+        stored = db_session.get(Token, hashlib.sha256(raw.encode()).hexdigest())
+        assert before + timedelta(seconds=ttl) <= stored.expires_at <= after + timedelta(seconds=ttl)
 
 
 class HiddenFields(HTMLParser):
