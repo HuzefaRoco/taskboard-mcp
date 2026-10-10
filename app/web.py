@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import parse_qs, quote
@@ -7,13 +8,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
 from app import tasks
+from app.config import get_settings
 from app.db import get_session
-from app.models import STATUS_COMPLETED, STATUS_OPEN, User
+from app.models import STATUS_COMPLETED, STATUS_OPEN, Token, User
 from app.security import normalize_email, verify_password
 
 router = APIRouter()
@@ -56,6 +59,40 @@ def task_list(
 @router.get("/login", response_class=HTMLResponse)
 def login_form(request: Request, next: str = "/") -> HTMLResponse:
     return templates.TemplateResponse(request=request, name="login.html", context={"next": next})
+
+
+@router.get("/connect", response_class=HTMLResponse)
+def connect_panel(
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(require_user)],
+) -> HTMLResponse:
+    connected = session.scalar(select(Token.token_hash).where(
+        Token.user_id == user.id,
+        Token.kind == "refresh",
+        Token.revoked_at.is_(None),
+        Token.expires_at > datetime.now(timezone.utc),
+    ).limit(1)) is not None
+    return templates.TemplateResponse(
+        request=request, name="connect.html",
+        context={"mcp_url": get_settings().public_base_url + "/mcp", "connected": connected},
+    )
+
+
+@router.post("/connect/disconnect")
+def disconnect(
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(require_user)],
+) -> RedirectResponse:
+    try:
+        session.execute(update(Token).where(Token.user_id == user.id).values(
+            revoked_at=datetime.now(timezone.utc),
+        ))
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        raise HTTPException(503, "Could not disconnect. Please try again.") from None
+    return RedirectResponse("/connect", status_code=303)
 
 
 async def login_fields(request: Request) -> dict[str, str]:

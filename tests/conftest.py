@@ -19,7 +19,7 @@ from app.config import get_settings
 if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
-    from app.models import Task, User
+    from app.models import Task, Token, User
 
 # Models import app.db during collection, so select the test database first.
 if os.environ.get("TEST_DATABASE_URL"):
@@ -181,6 +181,24 @@ def bearer_for(db_session: Session, oauth_client: str) -> Callable[..., str]:
         )
         db_session.commit()
         return issued["access_token"]
+
+    return issue
+
+
+@pytest.fixture
+def active_token(db_session: Session, oauth_client: str) -> Callable[["User"], "Token"]:
+    from app.models import Token
+    from app.security import issue_tokens, token_hash
+
+    def issue(user: "User") -> Token:
+        issued = issue_tokens(
+            db_session, user_id=user.id, client_id=oauth_client,
+            scope="tasks:read tasks:write", resource=get_settings().public_base_url,
+        )
+        db_session.commit()
+        token = db_session.get(Token, token_hash(issued["refresh_token"]))
+        assert token is not None
+        return token
 
     return issue
 

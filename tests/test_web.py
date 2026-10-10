@@ -8,6 +8,136 @@ import pytest
 from starlette.requests import Request
 
 
+MCP_LIST = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+
+
+def test_connect_shows_the_mcp_url_and_connection_state(client, sign_in, make_user,
+                                                        active_token):
+    user = make_user("a@example.com", "pw")
+    sign_in(user.email, "pw")
+    response = client.get("/connect")
+    assert response.status_code == 200
+    assert "https://tasks.example.com/mcp" in response.text
+    assert "Not connected" in response.text
+    active_token(user)
+    assert "Connected" in client.get("/connect").text
+
+
+@pytest.mark.parametrize("state", ["expired", "revoked", "access", "other_user"])
+def test_connect_requires_a_live_refresh_token_for_the_signed_in_user(
+    client, sign_in, make_user, active_token, db_session, state,
+):
+    from app.models import Token
+    from sqlalchemy import delete
+
+    user = make_user("a@example.com", "pw")
+    other = make_user("b@example.com", "pw")
+    token = active_token(other if state == "other_user" else user)
+    if state == "expired":
+        token.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    elif state == "revoked":
+        token.revoked_at = datetime.now(timezone.utc)
+    elif state == "access":
+        db_session.execute(delete(Token).where(Token.kind == "refresh"))
+    db_session.commit()
+    sign_in(user.email, "pw")
+    assert "Not connected" in client.get("/connect").text
+
+
+def test_disconnect_revokes_every_token_for_that_user(
+    client, sign_in, make_user, bearer_for, mcp_url, db_session, make_task, active_token,
+):
+    from sqlalchemy import select
+
+    from app.models import Task, Token
+
+    user = make_user("a@example.com", "pw")
+    other = make_user("b@example.com", "pw")
+    mine = make_task(user, "mine", "open")
+    theirs = make_task(other, "theirs", "completed")
+    token = bearer_for(user)
+    other_token = bearer_for(other)
+    expired = active_token(user)
+    expired.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    expired.revoked_at = datetime.now(timezone.utc) - timedelta(days=1)
+    db_session.commit()
+    before_tasks = db_session.execute(select(Task.id, Task.user_id, Task.title, Task.status,
+                                            Task.created_at).order_by(Task.id)).all()
+    sign_in(user.email, "pw")
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.post(mcp_url, json=MCP_LIST, headers=headers).status_code == 200
+    response = client.post("/connect/disconnect", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/connect"
+    assert client.post(mcp_url, json=MCP_LIST, headers=headers).status_code == 401
+    assert client.post(mcp_url, json=MCP_LIST,
+                       headers={"Authorization": f"Bearer {other_token}"}).status_code == 200
+    db_session.expire_all()
+    assert all(row.revoked_at is not None for row in db_session.scalars(
+        select(Token).where(Token.user_id == user.id)))
+    assert all(row.revoked_at is None for row in db_session.scalars(
+        select(Token).where(Token.user_id == other.id)))
+    assert db_session.execute(select(Task.id, Task.user_id, Task.title, Task.status,
+                                     Task.created_at).order_by(Task.id)).all() == before_tasks
+    assert len(before_tasks) == 2 and {row.id for row in before_tasks} == {mine.id, theirs.id}
+    assert "Not connected" in client.get("/connect").text
+    assert client.post("/connect/disconnect").status_code == 200
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/connect"),
+                                        ("POST", "/connect/disconnect")])
+def test_connect_routes_require_a_session(client, method, path):
+    response = client.request(method, path, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/login?next=")
+
+
+def test_connect_panel_controls(client, sign_in, make_user):
+    user = make_user("a@example.com", "pw")
+    sign_in(user.email, "pw")
+    body = client.get("/connect").text
+    assert 'id="connect-panel"' in body
+    assert 'hx-post="/connect/disconnect"' in body
+    assert 'hx-target="#connect-panel"' in body
+    assert 'hx-select="#connect-panel"' in body
+    assert 'hx-swap="outerHTML"' in body
+    assert "htmx.min.js" in body
+    assert "navigator.clipboard.writeText" in body
+    assert 'href="https://chatgpt.com/#settings/Connectors"' in body
+
+
+def test_disconnect_prevents_refreshing_tokens(client, tokens, oauth_client):
+    issued = tokens(oauth_client)
+    assert client.post("/connect/disconnect", follow_redirects=False).status_code == 303
+    response = client.post("/token", data={
+        "grant_type": "refresh_token", "refresh_token": issued["refresh_token"],
+        "client_id": oauth_client,
+    })
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_grant"
+
+
+def test_disconnect_commit_failure_rolls_back_and_hides_details(
+    client, sign_in, make_user, active_token, db_session, monkeypatch,
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    user = make_user("a@example.com", "pw")
+    token = active_token(user)
+    sign_in(user.email, "pw")
+
+    def fail_commit():
+        raise SQLAlchemyError("private database details")
+
+    monkeypatch.setattr(db_session, "commit", fail_commit)
+    response = client.post("/connect/disconnect", follow_redirects=False)
+    assert response.status_code == 503
+    assert "private database details" not in response.text
+    assert "Please try again" in response.text
+    db_session.expire_all()
+    assert token.revoked_at is None
+
+
 def test_task_list_shows_only_the_signed_in_users_tasks(client, make_user, make_task):
     a = make_user("a@example.com", "pw")
     b = make_user("b@example.com", "pw")

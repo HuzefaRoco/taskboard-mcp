@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Connect - Taskboard{% endblock %}
+{% block content %}
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js" defer></script>
+<script>
+    async function copyMcpUrl() {
+        const status = document.getElementById("copy-status");
+        try {
+            await navigator.clipboard.writeText(document.getElementById("mcp-url").textContent);
+            status.textContent = "Copied";
+        } catch (error) {
+            status.textContent = "Could not copy. Select and copy the URL.";
+        }
+    }
+</script>
+<section id="connect-panel" aria-labelledby="connect-title">
+    <h1 id="connect-title">Connect</h1>
+    <p role="status">{{ "Connected" if connected else "Not connected" }}</p>
+    <p>MCP URL: <code id="mcp-url" style="overflow-wrap: anywhere">{{ mcp_url }}</code></p>
+    <button type="button" onclick="copyMcpUrl()">Copy URL</button>
+    <span id="copy-status" role="status"></span>
+    <p>Connect from <a href="https://chatgpt.com/#settings/Connectors">ChatGPT's connector settings</a>.</p>
+    <form action="/connect/disconnect" method="post">
+        <button type="submit" hx-post="/connect/disconnect" hx-target="#connect-panel"
+                hx-select="#connect-panel" hx-swap="outerHTML">Disconnect</button>
+    </form>
+</section>
+{% endblock %}
