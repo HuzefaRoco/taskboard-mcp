@@ -117,13 +117,52 @@ def sign_in(client: "TestClient") -> Callable[[str, str], None]:
 
 
 @pytest.fixture
-def oauth_client(client: "TestClient") -> str:
-    response = client.post("/register", json={
-        "client_name": "ChatGPT",
-        "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
-    })
-    assert response.status_code == 201
-    return response.json()["client_id"]
+def register_connector(client: "TestClient") -> Callable[[], str]:
+    def register() -> str:
+        response = client.post("/register", json={
+            "client_name": "ChatGPT",
+            "redirect_uris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+        })
+        assert response.status_code == 201
+        return response.json()["client_id"]
+
+    return register
+
+
+@pytest.fixture
+def oauth_client(register_connector: Callable[[], str]) -> str:
+    return register_connector()
+
+
+@pytest.fixture
+def connect_user(client: "TestClient", make_user, sign_in) -> Callable[[str, str, str], str]:
+    from tests.test_oauth import AUTH, HiddenFields, TOKEN
+
+    def connect(email: str, password: str, client_id: str) -> str:
+        make_user(email, password)
+        sign_in(email, password)
+        verifier = secrets.token_urlsafe(32)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=")
+        resource = get_settings().public_base_url
+        consent = client.get("/authorize", params={
+            **AUTH, "client_id": client_id, "resource": resource,
+            "code_challenge": challenge.decode("ascii"),
+        })
+        assert consent.status_code == 200
+        response = client.post("/authorize", data={
+            **HiddenFields(consent.text).fields, "decision": "approve",
+        }, follow_redirects=False)
+        assert response.status_code == 303
+        redirect = parse_qs(urlsplit(response.headers["location"]).query)
+        assert redirect["state"] == [AUTH["state"]]
+        token = client.post("/token", data={
+            **TOKEN, "resource": resource, "code": redirect["code"][0],
+            "client_id": client_id, "code_verifier": verifier,
+        })
+        assert token.status_code == 200
+        return token.json()["access_token"]
+
+    return connect
 
 
 @pytest.fixture
@@ -205,7 +244,14 @@ def active_token(db_session: Session, oauth_client: str) -> Callable[["User"], "
 
 @pytest.fixture
 def call_tool() -> Callable[..., dict]:
-    def call(client: "TestClient", mcp_url: str, token: str, name: str, arguments: dict) -> dict:
+    def call(client: "TestClient", *args) -> dict:
+        if len(args) == 3:
+            mcp_url = "/mcp"
+            token, name, arguments = args
+        elif len(args) == 4:
+            mcp_url, token, name, arguments = args
+        else:
+            raise TypeError("Expected client, [mcp_url,] token, name, arguments")
         response = client.post(mcp_url, json={
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
