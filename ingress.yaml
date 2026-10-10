@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: taskboard-app
+  annotations: {}
+  labels:
+    app.kubernetes.io/name: taskboard
+    app.kubernetes.io/component: app
+spec:
+  ingressClassName: nginx
+  tls: []
+  rules:
+    - host: mcp.rocotal.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: taskboard-app
+                port:
+                  number: 80
