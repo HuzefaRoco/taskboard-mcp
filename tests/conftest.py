@@ -171,6 +171,34 @@ def mcp_url() -> str:
 
 
 @pytest.fixture
+def bearer_for(db_session: Session, oauth_client: str) -> Callable[..., str]:
+    from app.security import issue_tokens
+
+    def issue(user: "User", scope: str = "tasks:read tasks:write") -> str:
+        issued = issue_tokens(
+            db_session, user_id=user.id, client_id=oauth_client,
+            scope=scope, resource=get_settings().public_base_url,
+        )
+        db_session.commit()
+        return issued["access_token"]
+
+    return issue
+
+
+@pytest.fixture
+def call_tool() -> Callable[..., dict]:
+    def call(client: "TestClient", mcp_url: str, token: str, name: str, arguments: dict) -> dict:
+        response = client.post(mcp_url, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }, headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 200
+        return response.json()["result"]
+
+    return call
+
+
+@pytest.fixture
 def bearer(db_session: Session, make_user, oauth_client: str) -> str:
     from app.security import issue_tokens
 
