@@ -11,10 +11,10 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import Receive, Scope, Send
 
-from app import tasks
+from app import notes, tasks
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Task
+from app.models import Note, Task
 from app.security import SCOPE_READ, SCOPE_WRITE, resolve_access_token
 
 authenticated_user_id: ContextVar[UUID] = ContextVar("authenticated_user_id")
@@ -35,6 +35,14 @@ def _task_dict(task: Task) -> dict[str, str | None]:
     }
 
 
+def _note_dict(note: Note) -> dict[str, str]:
+    return {
+        "id": str(note.id),
+        "title": note.title,
+        "body": note.body,
+    }
+
+
 def build_mcp_server(get_user_id: Callable[[], UUID]) -> MCPServer:
     server = MCPServer("taskboard")
     read_meta = {"securitySchemes": [{"type": "oauth2", "scopes": [SCOPE_READ]}]}
@@ -51,6 +59,17 @@ def build_mcp_server(get_user_id: Callable[[], UUID]) -> MCPServer:
         except SQLAlchemyError as exc:
             raise ToolError("Task operation failed") from exc
 
+    @server.tool(meta=write_meta)
+    def create_note(title: str, body: str) -> dict[str, str]:
+        """Create a note."""
+        _require_scope(SCOPE_WRITE)
+        try:
+            with SessionLocal.begin() as session:
+                note = notes.add_note(session, get_user_id(), title, body)
+                return _note_dict(note)
+        except SQLAlchemyError as exc:
+            raise ToolError("Note operation failed") from exc
+
     @server.tool(meta=read_meta)
     def list_tasks(status: Literal["open", "completed"] | None = None) -> dict[str, list[dict[str, str | None]]]:
         """List tasks, optionally filtered by status."""
@@ -60,6 +79,16 @@ def build_mcp_server(get_user_id: Callable[[], UUID]) -> MCPServer:
                 return {"tasks": [_task_dict(task) for task in tasks.list_tasks(session, get_user_id(), status)]}
         except SQLAlchemyError as exc:
             raise ToolError("Task operation failed") from exc
+
+    @server.tool(meta=read_meta)
+    def list_notes() -> dict[str, list[dict[str, str]]]:
+        """List notes."""
+        _require_scope(SCOPE_READ)
+        try:
+            with SessionLocal() as session:
+                return {"notes": [_note_dict(note) for note in notes.list_notes(session, get_user_id())]}
+        except SQLAlchemyError as exc:
+            raise ToolError("Note operation failed") from exc
 
     @server.tool(meta=write_meta)
     def complete_task(task_id: UUID) -> dict[str, str | None]:

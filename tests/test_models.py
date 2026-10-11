@@ -12,7 +12,7 @@ def test_schema_exists(db_session):
     tables = set(db_session.execute(text(
         "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
     )).scalars())
-    assert {"users", "tasks", "oauth_clients",
+    assert {"users", "tasks", "notes", "oauth_clients",
             "oauth_authorization_codes", "oauth_tokens"} <= tables
 
 

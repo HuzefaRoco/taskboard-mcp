@@ -24,12 +24,13 @@ def test_mcp_lists_tools_with_a_valid_token(client, mcp_url, bearer):
     tools = {t["name"]: t for t in r.json()["result"]["tools"]}
     assert {
         "add_task", "list_tasks", "complete_task", "delete_task", "update_task",
-        "reopen_task", "clear_completed_tasks",
+        "reopen_task", "clear_completed_tasks", "create_note", "list_notes",
     } == set(tools)
     for name, scope in [("list_tasks", "tasks:read"), ("add_task", "tasks:write"),
                         ("complete_task", "tasks:write"), ("delete_task", "tasks:write"),
                         ("update_task", "tasks:write"), ("reopen_task", "tasks:write"),
-                        ("clear_completed_tasks", "tasks:write")]:
+                        ("clear_completed_tasks", "tasks:write"),
+                        ("list_notes", "tasks:read"), ("create_note", "tasks:write")]:
         assert tools[name]["_meta"]["securitySchemes"] == [{"type": "oauth2", "scopes": [scope]}]
 
 
@@ -80,6 +81,22 @@ def test_tools_scope_to_the_tokens_user(client, mcp_url, bearer_for, make_user, 
         assert listed["structuredContent"]["tasks"] == [expected]
 
 
+def test_notes_scope_to_the_tokens_user(client, mcp_url, bearer_for, make_user, call_tool):
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    token_a, token_b = bearer_for(a), bearer_for(b)
+    mine = call_tool(client, mcp_url, token_a, "create_note", {
+        "title": "mine", "body": "alpha",
+    })["structuredContent"]
+    assert mine == {"id": mine["id"], "title": "mine", "body": "alpha"}
+    theirs = call_tool(client, mcp_url, token_b, "create_note", {
+        "title": "theirs", "body": "bravo",
+    })["structuredContent"]
+    for token, expected in [(token_a, mine), (token_b, theirs), (token_a, mine)]:
+        listed = call_tool(client, mcp_url, token, "list_notes", {})
+        assert listed["structuredContent"]["notes"] == [expected]
+
+
 def test_a_user_cannot_complete_another_users_task(client, mcp_url, bearer_for, make_user, call_tool):
     a = make_user("a@example.com", "pw")
     b = make_user("b@example.com", "pw")
@@ -112,6 +129,8 @@ def test_list_tasks_uses_one_status_vocabulary(client, mcp_url, bearer_for, make
     ("update_task", {}, "tasks:read"),
     ("reopen_task", {}, "tasks:read"),
     ("clear_completed_tasks", {}, "tasks:read"),
+    ("list_notes", {}, "tasks:write"),
+    ("create_note", {"title": "denied", "body": "hidden"}, "tasks:read"),
     ("list_tasks", {}, ""),
     ("add_task", {"title": "denied"}, "tasks:write:extra"),
 ])
@@ -127,7 +146,7 @@ def test_tools_require_their_scope(client, mcp_url, bearer_for, make_user, make_
         arguments = {"task_id": task_id, "title": "denied"}
     result = call_tool(client, mcp_url, token, name, arguments)
     assert result.get("isError") is True
-    required_scope = "tasks:read" if name == "list_tasks" else "tasks:write"
+    required_scope = "tasks:read" if name in ("list_tasks", "list_notes") else "tasks:write"
     assert f"Missing required scope: {required_scope}" in result["content"][0]["text"]
     full_token = bearer_for(user)
     assert call_tool(client, mcp_url, full_token, "list_tasks", {})["structuredContent"] == {
@@ -142,6 +161,10 @@ def test_tools_accept_only_the_scope_they_need(client, mcp_url, bearer_for, make
     done = call_tool(client, mcp_url, write, "complete_task", {"task_id": made["id"]})["structuredContent"]
     read = bearer_for(user, "tasks:read")
     assert call_tool(client, mcp_url, read, "list_tasks", {})["structuredContent"] == {"tasks": [done]}
+    note = call_tool(client, mcp_url, write, "create_note", {
+        "title": "memo", "body": "details",
+    })["structuredContent"]
+    assert call_tool(client, mcp_url, read, "list_notes", {})["structuredContent"] == {"notes": [note]}
 
 
 def test_missing_task_returns_tool_error(client, mcp_url, bearer, call_tool):
@@ -153,6 +176,7 @@ def test_missing_task_returns_tool_error(client, mcp_url, bearer, call_tool):
 
 @pytest.mark.parametrize("name,arguments", [
     ("list_tasks", {"status": "complete"}),
+    ("create_note", {"title": "missing body"}),
     ("complete_task", {"task_id": "not-a-uuid"}),
     ("add_task", {"title": None}),
 ])
