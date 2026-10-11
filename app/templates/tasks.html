@@ -17,4 +17,17 @@
     {% endfor %}
     </tbody>
 </table>
+<section aria-label="Notes">
+    <h1>Notes</h1>
+    <table id="notes-table">
+        <thead><tr><th scope="col">Title</th><th scope="col">Body</th></tr></thead>
+        <tbody>
+        {% for note in notes %}
+            <tr><td>{{ note.title }}</td><td>{{ note.body }}</td></tr>
+        {% else %}
+            <tr><td colspan="2">No notes</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</section>
 {% endblock %}

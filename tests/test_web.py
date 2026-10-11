@@ -148,6 +148,22 @@ def test_task_list_shows_only_the_signed_in_users_tasks(client, make_user, make_
     assert "mine" in body and "theirs" not in body
 
 
+def test_task_list_shows_only_the_signed_in_users_notes(client, make_user, sign_in, db_session):
+    from app import notes
+
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    notes.add_note(db_session, a.id, "My note", "private details")
+    notes.add_note(db_session, b.id, "Their note", "hidden details")
+    sign_in(a.email, "pw")
+
+    body = client.get("/").text
+
+    assert "<h1>Notes</h1>" in body
+    assert "My note" in body and "private details" in body
+    assert "Their note" not in body and "hidden details" not in body
+
+
 def test_task_list_filters_by_status(client, make_user, make_task):
     a = make_user("a@example.com", "pw")
     make_task(a, "still open", "open")

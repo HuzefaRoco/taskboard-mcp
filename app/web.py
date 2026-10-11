@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
-from app import tasks
+from app import notes, tasks
 from app.config import get_settings
 from app.db import get_session
 from app.models import STATUS_COMPLETED, STATUS_OPEN, Token, User
@@ -52,7 +52,10 @@ def task_list(
         status = None
     return templates.TemplateResponse(
         request=request, name="tasks.html",
-        context={"tasks": tasks.list_tasks(session, user.id, status)},
+        context={
+            "tasks": tasks.list_tasks(session, user.id, status),
+            "notes": notes.list_notes(session, user.id),
+        },
     )
 
 
