@@ -22,9 +22,14 @@ def test_mcp_lists_tools_with_a_valid_token(client, mcp_url, bearer):
                     headers={"Authorization": f"Bearer {bearer}"}, follow_redirects=False)
     assert r.status_code == 200
     tools = {t["name"]: t for t in r.json()["result"]["tools"]}
-    assert {"add_task", "list_tasks", "complete_task"} == set(tools)
+    assert {
+        "add_task", "list_tasks", "complete_task", "delete_task", "update_task",
+        "reopen_task", "clear_completed_tasks",
+    } == set(tools)
     for name, scope in [("list_tasks", "tasks:read"), ("add_task", "tasks:write"),
-                        ("complete_task", "tasks:write")]:
+                        ("complete_task", "tasks:write"), ("delete_task", "tasks:write"),
+                        ("update_task", "tasks:write"), ("reopen_task", "tasks:write"),
+                        ("clear_completed_tasks", "tasks:write")]:
         assert tools[name]["_meta"]["securitySchemes"] == [{"type": "oauth2", "scopes": [scope]}]
 
 
@@ -68,7 +73,7 @@ def test_tools_scope_to_the_tokens_user(client, mcp_url, bearer_for, make_user, 
     b = make_user("b@example.com", "pw")
     token_a, token_b = bearer_for(a), bearer_for(b)
     mine = call_tool(client, mcp_url, token_a, "add_task", {"title": "mine"})["structuredContent"]
-    assert mine == {"id": mine["id"], "title": "mine", "status": "open"}
+    assert mine == {"id": mine["id"], "title": "mine", "description": None, "status": "open"}
     theirs = call_tool(client, mcp_url, token_b, "add_task", {"title": "theirs"})["structuredContent"]
     for token, expected in [(token_a, mine), (token_b, theirs), (token_a, mine)]:
         listed = call_tool(client, mcp_url, token, "list_tasks", {})
@@ -103,6 +108,10 @@ def test_list_tasks_uses_one_status_vocabulary(client, mcp_url, bearer_for, make
     ("list_tasks", {}, "tasks:write"),
     ("add_task", {"title": "denied"}, "tasks:read"),
     ("complete_task", {}, "tasks:read"),
+    ("delete_task", {}, "tasks:read"),
+    ("update_task", {}, "tasks:read"),
+    ("reopen_task", {}, "tasks:read"),
+    ("clear_completed_tasks", {}, "tasks:read"),
     ("list_tasks", {}, ""),
     ("add_task", {"title": "denied"}, "tasks:write:extra"),
 ])
@@ -112,15 +121,17 @@ def test_tools_require_their_scope(client, mcp_url, bearer_for, make_user, make_
     task = make_task(user, "untouched", "open")
     task_id = str(task.id)
     token = bearer_for(user, scope)
-    if name == "complete_task":
+    if name in ("complete_task", "delete_task", "reopen_task"):
         arguments = {"task_id": task_id}
+    elif name == "update_task":
+        arguments = {"task_id": task_id, "title": "denied"}
     result = call_tool(client, mcp_url, token, name, arguments)
     assert result.get("isError") is True
     required_scope = "tasks:read" if name == "list_tasks" else "tasks:write"
     assert f"Missing required scope: {required_scope}" in result["content"][0]["text"]
     full_token = bearer_for(user)
     assert call_tool(client, mcp_url, full_token, "list_tasks", {})["structuredContent"] == {
-        "tasks": [{"id": task_id, "title": "untouched", "status": "open"}],
+        "tasks": [{"id": task_id, "title": "untouched", "description": None, "status": "open"}],
     }
 
 
@@ -177,7 +188,100 @@ def test_task_database_failure_rolls_back_and_hides_details(
     assert result.get("isError") is True
     assert result["content"][0]["text"] == f"Error executing tool {name}: Task operation failed"
     assert call_tool(client, mcp_url, token, "list_tasks", {})["structuredContent"] == {
-        "tasks": [{"id": task_id, "title": "untouched", "status": "open"}],
+        "tasks": [{"id": task_id, "title": "untouched", "description": None, "status": "open"}],
+    }
+
+
+def test_delete_task_removes_and_returns_the_callers_task(
+    client, mcp_url, bearer_for, make_user, make_task, call_tool,
+):
+    user = make_user("a@example.com", "pw")
+    task = make_task(user, "typo", "open")
+    token = bearer_for(user)
+    deleted = call_tool(client, mcp_url, token, "delete_task", {"task_id": str(task.id)})
+    assert deleted["structuredContent"] == {
+        "id": str(task.id), "title": "typo", "description": None, "status": "open",
+    }
+    assert call_tool(client, mcp_url, token, "list_tasks", {})["structuredContent"] == {"tasks": []}
+
+
+@pytest.mark.parametrize("tool_name", ["delete_task", "update_task", "reopen_task"])
+def test_write_tools_hide_other_users_tasks_and_missing_ids(
+    client, mcp_url, bearer_for, make_user, make_task, call_tool, tool_name,
+):
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    task = make_task(b, "theirs", "completed")
+    token_a = bearer_for(a)
+    arguments = {"task_id": str(task.id)}
+    if tool_name == "update_task":
+        arguments["title"] = "changed"
+    result = call_tool(client, mcp_url, token_a, tool_name, arguments)
+    assert result.get("isError") is True
+    assert result["content"][0]["text"] == (
+        f"Error executing tool {tool_name}: Task not found: {task.id}"
+    )
+    token_b = bearer_for(b)
+    assert call_tool(client, mcp_url, token_b, "list_tasks", {})["structuredContent"] == {
+        "tasks": [{"id": str(task.id), "title": "theirs", "description": None, "status": "completed"}],
+    }
+
+
+def test_update_task_changes_title_or_description(client, mcp_url, bearer_for, make_user, make_task, call_tool):
+    user = make_user("a@example.com", "pw")
+    task = make_task(user, "old", "open")
+    token = bearer_for(user)
+    updated = call_tool(client, mcp_url, token, "update_task", {
+        "task_id": str(task.id), "title": "new", "description": "notes",
+    })
+    assert updated["structuredContent"] == {
+        "id": str(task.id), "title": "new", "description": "notes", "status": "open",
+    }
+    cleared = call_tool(client, mcp_url, token, "update_task", {
+        "task_id": str(task.id), "description": "",
+    })
+    assert cleared["structuredContent"] == {
+        "id": str(task.id), "title": "new", "description": "", "status": "open",
+    }
+
+
+def test_update_task_rejects_empty_update(client, mcp_url, bearer_for, make_user, make_task, call_tool):
+    user = make_user("a@example.com", "pw")
+    task = make_task(user, "unchanged", "open")
+    token = bearer_for(user)
+    result = call_tool(client, mcp_url, token, "update_task", {"task_id": str(task.id)})
+    assert result.get("isError") is True
+    assert "At least one of title or description is required" in result["content"][0]["text"]
+    assert call_tool(client, mcp_url, token, "list_tasks", {})["structuredContent"] == {
+        "tasks": [{"id": str(task.id), "title": "unchanged", "description": None, "status": "open"}],
+    }
+
+
+def test_reopen_task_returns_completed_task_to_open(client, mcp_url, bearer_for, make_user, make_task, call_tool):
+    user = make_user("a@example.com", "pw")
+    task = make_task(user, "resume", "completed")
+    token = bearer_for(user)
+    expected = {"id": str(task.id), "title": "resume", "description": None, "status": "open"}
+    assert call_tool(client, mcp_url, token, "reopen_task", {"task_id": str(task.id)})["structuredContent"] == expected
+    assert call_tool(client, mcp_url, token, "reopen_task", {"task_id": str(task.id)})["structuredContent"] == expected
+
+
+def test_clear_completed_tasks_deletes_only_callers_completed_tasks(
+    client, mcp_url, bearer_for, make_user, make_task, call_tool,
+):
+    a = make_user("a@example.com", "pw")
+    b = make_user("b@example.com", "pw")
+    open_task = make_task(a, "keep", "open")
+    make_task(a, "done 1", "completed")
+    make_task(a, "done 2", "completed")
+    other = make_task(b, "theirs", "completed")
+    token_a, token_b = bearer_for(a), bearer_for(b)
+    assert call_tool(client, mcp_url, token_a, "clear_completed_tasks", {})["structuredContent"] == {"deleted": 2}
+    assert call_tool(client, mcp_url, token_a, "list_tasks", {})["structuredContent"] == {
+        "tasks": [{"id": str(open_task.id), "title": "keep", "description": None, "status": "open"}],
+    }
+    assert call_tool(client, mcp_url, token_b, "list_tasks", {})["structuredContent"] == {
+        "tasks": [{"id": str(other.id), "title": "theirs", "description": None, "status": "completed"}],
     }
 
 

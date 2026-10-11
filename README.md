@@ -75,9 +75,14 @@ Custom MCP server availability depends on your account and workspace settings.
 | `add_task(title)` | `tasks:write` | Create an `open` task for the authenticated user. |
 | `list_tasks(status)` | `tasks:read` | List that user's tasks; optionally filter by `open` or `completed`. |
 | `complete_task(task_id)` | `tasks:write` | Mark that user's task `completed`. |
+| `delete_task(task_id)` | `tasks:write` | Permanently delete that user's task. |
+| `update_task(task_id, title, description)` | `tasks:write` | Edit that user's task title or optional description notes. |
+| `reopen_task(task_id)` | `tasks:write` | Mark that user's task `open` again. |
+| `clear_completed_tasks()` | `tasks:write` | Permanently delete all completed tasks for that user. |
 
 Task statuses are exactly `open` and `completed`. OAuth scopes are exactly
-`tasks:read` and `tasks:write`. Another user's task cannot be listed or completed.
+`tasks:read` and `tasks:write`. Task descriptions are optional notes surfaced
+through MCP responses. Another user's task cannot be listed or changed.
 
 The website is read-only by design for tasks: it displays your tasks and filters
 them, but has no route to create, complete, or delete a task. It also supports

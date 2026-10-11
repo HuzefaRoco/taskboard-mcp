@@ -240,20 +240,42 @@ def test_task_helpers_complete_persists_and_is_idempotent(db_session, make_user)
     assert tasks.complete_task(db_session, user.id, task_id).status == "completed"
 
 
+def test_task_helpers_update_delete_reopen_and_clear(db_session, make_user, make_task):
+    from app import tasks
+
+    user = make_user("a@example.com", "pw")
+    open_task = make_task(user, "old", "open")
+    completed = make_task(user, "done", "completed")
+    assert tasks.update_task(db_session, user.id, open_task.id, title="new").title == "new"
+    assert tasks.update_task(db_session, user.id, open_task.id, description="notes").description == "notes"
+    assert tasks.reopen_task(db_session, user.id, completed.id).status == "open"
+    db_session.expire_all()
+    assert tasks.delete_task(db_session, user.id, open_task.id).title == "new"
+    assert tasks.clear_completed_tasks(db_session, user.id) == 0
+    assert [task.id for task in tasks.list_tasks(db_session, user.id)] == [completed.id]
+
+
 def test_task_helpers_hide_other_users_tasks_and_missing_ids(db_session, make_user, make_task):
     from app import tasks
 
     a = make_user("a@example.com", "pw")
     b = make_user("b@example.com", "pw")
     task_id = make_task(b, "theirs", "open").id
-    for missing_id in (task_id, uuid4()):
-        with pytest.raises(tasks.TaskNotFound):
-            tasks.complete_task(db_session, a.id, missing_id)
+    operations = [
+        lambda missing_id: tasks.complete_task(db_session, a.id, missing_id),
+        lambda missing_id: tasks.delete_task(db_session, a.id, missing_id),
+        lambda missing_id: tasks.reopen_task(db_session, a.id, missing_id),
+        lambda missing_id: tasks.update_task(db_session, a.id, missing_id, title="changed"),
+    ]
+    for operation in operations:
+        for missing_id in (task_id, uuid4()):
+            with pytest.raises(tasks.TaskNotFound):
+                operation(missing_id)
     assert tasks.list_tasks(db_session, a.id) == []
     assert tasks.list_tasks(db_session, b.id)[0].status == "open"
 
 
-@pytest.mark.parametrize("operation", ["add", "list", "complete"])
+@pytest.mark.parametrize("operation", ["add", "list", "complete", "delete", "update", "reopen", "clear"])
 @pytest.mark.parametrize("pending_change", ["update", "insert", "delete"])
 def test_task_helpers_do_not_flush_unrelated_tasks(
     db_session, make_user, make_task, operation, pending_change,
@@ -267,6 +289,9 @@ def test_task_helpers_do_not_flush_unrelated_tasks(
     b = make_user("b@example.com", "pw")
     mine = make_task(a, "mine", "open")
     make_task(b, "theirs", "open")
+    if operation in ("reopen", "clear"):
+        mine.status = "completed"
+        db_session.flush()
     unrelated = tasks.list_tasks(db_session, b.id)[0]
     if pending_change == "update":
         unrelated.title = "unauthorized change"
@@ -282,7 +307,16 @@ def test_task_helpers_do_not_flush_unrelated_tasks(
     elif operation == "list":
         assert tasks.list_tasks(db_session, a.id) == [mine]
     else:
-        assert tasks.complete_task(db_session, a.id, mine.id).status == "completed"
+        if operation == "complete":
+            assert tasks.complete_task(db_session, a.id, mine.id).status == "completed"
+        elif operation == "delete":
+            assert tasks.delete_task(db_session, a.id, mine.id).title == "mine"
+        elif operation == "update":
+            assert tasks.update_task(db_session, a.id, mine.id, description="notes").description == "notes"
+        elif operation == "reopen":
+            assert tasks.reopen_task(db_session, a.id, mine.id).status == "open"
+        else:
+            assert tasks.clear_completed_tasks(db_session, a.id) == 1
 
     # Read stored values directly, bypassing autoflush and the ORM identity map.
     connection = db_session.connection()
@@ -294,7 +328,9 @@ def test_task_helpers_do_not_flush_unrelated_tasks(
     own_rows = connection.execute(
         select(Task.title, Task.status).where(Task.user_id == a.id).order_by(Task.title)
     ).all()
-    expected = [("mine", "completed" if operation == "complete" else "open")]
+    expected = []
+    if operation not in ("delete", "clear"):
+        expected = [("mine", "completed" if operation == "complete" else "open")]
     if operation == "add":
         expected.insert(0, ("added", "open"))
     assert own_rows == expected

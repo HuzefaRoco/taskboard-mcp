@@ -9,7 +9,7 @@ A person who owns Tasks and connects their ChatGPT to the taskboard. Identified 
 _Avoid_: Account, member, customer
 
 **Task**:
-A single to-do owned by exactly one User, with a title and a status.
+A single to-do owned by exactly one User, with a title, optional description notes, and a status.
 _Avoid_: Item, todo, ticket, card
 
 **Connection**:
