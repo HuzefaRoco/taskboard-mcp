@@ -126,7 +126,7 @@ spec:
             - until pg_isready -h taskboard-db -p 5432 -U taskboard -d taskboard; do sleep 2; done
       containers:
         - name: app
-          image: sultanhaseeb/taskboard.mcp:v1
+          image: sultanhaseeb/taskboard.mcp:v20261011155545
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
